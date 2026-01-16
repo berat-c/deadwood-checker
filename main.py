@@ -6,9 +6,11 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
-
+import webbrowser
 import psutil
 import requests
+from PIL import Image, ImageDraw, ImageTk
+
 
 # Tray
 import pystray
@@ -120,6 +122,28 @@ def send_webhook_message(content: str) -> None:
 
 def ensure_config_dir():
     APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def resource_path(relative_path: str) -> str:
+    """
+    Get absolute path to resource, works for dev and for PyInstaller one-file exe.
+    """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+def set_window_icon(root):
+    try:
+        img_path = resource_path("HavenBornLogo.png")
+        img = Image.open(img_path).convert("RGBA")
+        icon = ImageTk.PhotoImage(img)
+        root.iconphoto(True, icon)
+        root._icon_ref = icon  # prevent garbage collection
+    except Exception as e:
+        print("Failed to set window icon:", e)
 
 
 def load_config() -> dict:
@@ -326,9 +350,30 @@ class DeadwoodApp:
 
         tk.Label(
             frame,
-            text="Tip: When minimized, use the tray icon menu to show/stop/exit.",
+            text="- When minimized, use the tray icon menu to show / stop / exit.",
             fg="gray",
         ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        tk.Label(
+            frame,
+            text="- Closing this window will hide the app to system tray menu.",
+            fg="gray",
+        ).grid(row=8, column=0, columnspan=2, sticky="w")
+
+        def open_github(event=None):
+            webbrowser.open_new("https://github.com/berat-c/deadwood-checker")
+
+        link = tk.Label(
+            frame,
+            text="Made by Biretro",
+            fg="#4ea3ff",  # link-like blue
+            cursor="hand2",
+        )
+
+        link.bind("<Button-1>", open_github)
+        link.bind("<Enter>", lambda e: link.config(font=("Segoe UI", 9, "underline")))
+        link.bind("<Leave>", lambda e: link.config(font=("Segoe UI", 9)))
+        link.grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
     def set_status(self, text: str):
         self.status_var.set(text)
@@ -350,7 +395,7 @@ class DeadwoodApp:
         try:
             set_run_at_startup(enabled)
             self.persist_config()
-            self.set_status("Status: Startup setting updated")
+            self.set_status("Status: Saved")
         except Exception as e:
             self.run_startup_var.set(not enabled)
             messagebox.showerror("Startup error", f"Couldn't update startup setting:\n{e}")
@@ -487,12 +532,19 @@ class DeadwoodApp:
             self.root.after(0, self.exit_app)
 
         menu = pystray.Menu(
-            pystray.MenuItem("Show window", on_show),
+            pystray.MenuItem("Open", on_show, default=True),  # <-- double-click triggers this
             pystray.MenuItem("Stop monitoring", on_stop),
             pystray.MenuItem("Exit", on_exit),
         )
 
         self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+
+        def on_activate(icon, item=None):
+            # Double-click (or left-click on some systems) should show the window
+            self.root.after(0, self.show_window)
+
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        self.tray_icon.on_activate = on_activate
 
         def run_tray():
             self.tray_icon.run()
@@ -533,6 +585,7 @@ class DeadwoodApp:
 
 def main():
     root = tk.Tk()
+    set_window_icon(root)   # 👈 THIS sets the feather icon
     app = DeadwoodApp(root)
     root.mainloop()
 
