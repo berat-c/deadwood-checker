@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual envs
+venv/
+.env/
+
+# PyCharm
+.idea/
+*.iml
+
+# Builds
+dist/
+build/
+*.exe
+*.spec
+*.dll
+*.pyd
+*.zip
+*.pkg

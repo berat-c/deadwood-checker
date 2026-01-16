@@ -1,0 +1,513 @@
+import os
+import sys
+import json
+import time
+import threading
+from pathlib import Path
+import tkinter as tk
+from tkinter import messagebox
+
+import psutil
+import requests
+
+# Tray
+import pystray
+from PIL import Image, ImageDraw
+
+# Startup registry (Windows)
+import winreg
+
+# WinAPI window title scan
+import ctypes
+from ctypes import wintypes
+
+
+# ====== BACKEND CONFIG ======
+PROCESS_NAME = "RedM_GTAProcess.exe"
+
+CHECK_IDLE_SEC = 5        # slower loop when idle / not in deadwood
+CHECK_ACTIVE_SEC = 2      # faster loop while confirming deadwood
+REQUIRED_HITS = 2         # must see deadwood this many consecutive checks
+GRACE_AFTER_PROCESS_START_SEC = 30  # wait after RedM starts before title checks
+
+# Webhook is handled on "backend" (not user-editable in UI)
+WEBHOOK_URL = "https://discord.com/api/webhooks/1461755396526968843/_t6-ZBsJeD50cdJP3sVIaP5EQCm40abaINzgYLxBxs6VwaC5kUgFs2_WZRGTRw_vT-qD"
+# ============================
+
+APP_NAME = "Deadwood Presence Checker"
+RUN_KEY_NAME = "DeadwoodPresenceChecker"
+
+APPDATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
+CONFIG_PATH = APPDATA_DIR / "config.json"
+
+
+# ===== WinAPI: enumerate visible windows and read titles =====
+user32 = ctypes.windll.user32
+
+EnumWindows = user32.EnumWindows
+EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+GetWindowTextLengthW = user32.GetWindowTextLengthW
+GetWindowTextW = user32.GetWindowTextW
+IsWindowVisible = user32.IsWindowVisible
+
+# Safer signatures (reduces weird crashes)
+EnumWindows.restype = wintypes.BOOL
+EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+
+GetWindowTextLengthW.restype = ctypes.c_int
+GetWindowTextLengthW.argtypes = [wintypes.HWND]
+
+GetWindowTextW.restype = ctypes.c_int
+GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+IsWindowVisible.restype = wintypes.BOOL
+IsWindowVisible.argtypes = [wintypes.HWND]
+
+
+def any_window_title_contains(substring: str) -> bool:
+    """
+    Returns True if ANY visible top-level window title contains substring (case-insensitive).
+    Stops early as soon as it finds a match.
+    """
+    target = substring.lower()
+    found = False
+
+    @EnumWindowsProc
+    def enum_proc(hwnd, lparam):
+        nonlocal found
+        if found:
+            return False  # stop early
+
+        if not IsWindowVisible(hwnd):
+            return True
+
+        length = GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+
+        buf = ctypes.create_unicode_buffer(length + 1)
+        GetWindowTextW(hwnd, buf, length + 1)
+
+        title = (buf.value or "").strip().lower()
+        if title and (target in title):
+            found = True
+            return False  # stop early
+
+        return True
+
+    EnumWindows(enum_proc, 0)
+    return found
+
+
+def is_process_running(proc_name: str) -> bool:
+    target = proc_name.lower()
+    for p in psutil.process_iter(["name"]):
+        try:
+            name = (p.info.get("name") or "").lower()
+            if name == target:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            continue
+    return False
+
+
+def send_webhook_message(content: str) -> None:
+    r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+    r.raise_for_status()
+
+
+def ensure_config_dir():
+    APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_config() -> dict:
+    ensure_config_dir()
+    if not CONFIG_PATH.exists():
+        return {
+            "nickname": "Ezekiel",
+            "run_at_startup": False,
+            "run_minimized": False,
+        }
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "nickname": "Ezekiel",
+            "run_at_startup": False,
+            "run_minimized": False,
+        }
+
+
+def save_config(cfg: dict) -> None:
+    ensure_config_dir()
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def get_startup_command() -> str:
+    """
+    Returns the command stored in HKCU Run. Works for both:
+    - packaged exe (sys.executable points to exe)
+    - running as script (use pythonw.exe for no console)
+    """
+    exe = sys.executable
+
+    # If running as a .py script, prefer pythonw.exe to avoid a console window
+    if exe.lower().endswith("python.exe"):
+        pythonw = exe[:-10] + "pythonw.exe"
+        if os.path.exists(pythonw):
+            exe = pythonw
+
+    script = os.path.abspath(sys.argv[0])
+
+    # If packaged, sys.argv[0] is usually the exe itself; still safe
+    if exe.lower().endswith(".exe") and script.lower().endswith(".exe"):
+        return f'"{exe}"'
+    return f'"{exe}" "{script}"'
+
+
+def set_run_at_startup(enabled: bool) -> None:
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        0,
+        winreg.KEY_SET_VALUE,
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, RUN_KEY_NAME, 0, winreg.REG_SZ, get_startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, RUN_KEY_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def is_startup_enabled() -> bool:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            winreg.QueryValueEx(key, RUN_KEY_NAME)
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def ask_user_to_announce(nickname: str) -> bool:
+    temp = tk.Tk()
+    temp.withdraw()
+    temp.attributes("-topmost", True)
+    msg = f'Seems like you are waking up as "{nickname}" in Deadwood.\nDo you wanna let people know?'
+    res = messagebox.askyesno("Deadwood Presence", msg, parent=temp)
+    temp.destroy()
+    return res
+
+
+def create_tray_icon_image() -> Image.Image:
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((6, 6, size - 6, size - 6), radius=14, outline=(255, 255, 255, 255), width=3)
+    d.text((22, 16), "D", fill=(255, 255, 255, 255))
+    d.ellipse((42, 40, 52, 50), fill=(255, 255, 255, 255))
+    return img
+
+
+class DeadwoodApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(APP_NAME)
+        self.root.resizable(False, False)
+
+        self.cfg = load_config()
+
+        # Monitoring state
+        self.monitoring = False
+        self.stop_event = threading.Event()
+        self.worker_thread = None
+
+        # Tray
+        self.tray_icon = None
+        self.tray_thread = None
+        self.is_hidden_to_tray = False
+
+        # UI variables
+        self.nickname_var = tk.StringVar(value=self.cfg.get("nickname", "Ezekiel"))
+        self.run_minimized_var = tk.BooleanVar(value=bool(self.cfg.get("run_minimized", False)))
+
+        startup_state = is_startup_enabled() if self.cfg.get("run_at_startup") else False
+        self.run_startup_var = tk.BooleanVar(value=startup_state)
+
+        self.status_var = tk.StringVar(value=f"Status: Idle (watching {PROCESS_NAME})")
+        self.build_ui()
+
+        # Apply startup if config wants it but registry differs
+        if self.cfg.get("run_at_startup", False) and not startup_state:
+            try:
+                set_run_at_startup(True)
+                self.run_startup_var.set(True)
+            except Exception:
+                self.run_startup_var.set(False)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Auto-start minimized if configured
+        if self.run_minimized_var.get():
+            self.start_monitoring(minimize=True)
+
+    def build_ui(self):
+        pad = 12
+        frame = tk.Frame(self.root, padx=pad, pady=pad)
+        frame.pack()
+
+        tk.Label(frame, text="Nickname").grid(row=0, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.nickname_var, width=32).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.cb_startup = tk.Checkbutton(
+            frame,
+            text="Run at startup",
+            variable=self.run_startup_var,
+            command=self.on_toggle_startup,
+        )
+        self.cb_startup.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        self.cb_minimized = tk.Checkbutton(
+            frame,
+            text="Run minimized",
+            variable=self.run_minimized_var,
+            command=self.on_toggle_run_minimized,
+        )
+        self.cb_minimized.grid(row=2, column=0, columnspan=2, sticky="w")
+
+        tk.Label(frame, textvariable=self.status_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        btns = tk.Frame(frame)
+        btns.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        self.btn_start = tk.Button(btns, text="Start monitoring", command=lambda: self.start_monitoring(minimize=False))
+        self.btn_start.pack(side="left")
+
+        self.btn_start_min = tk.Button(
+            btns,
+            text="Start monitoring and minimize",
+            command=lambda: self.start_monitoring(minimize=True),
+        )
+        self.btn_start_min.pack(side="left", padx=(8, 0))
+
+        self.btn_stop = tk.Button(btns, text="Stop", command=self.stop_monitoring, state="disabled")
+        self.btn_stop.pack(side="left", padx=(8, 0))
+
+        tk.Label(
+            frame,
+            text="Tip: When minimized, use the tray icon menu to show/stop/exit.",
+            fg="gray",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+    def set_status(self, text: str):
+        self.status_var.set(text)
+
+    def persist_config(self):
+        self.cfg["nickname"] = self.nickname_var.get().strip() or "Ezekiel"
+        self.cfg["run_at_startup"] = bool(self.run_startup_var.get())
+        self.cfg["run_minimized"] = bool(self.run_minimized_var.get())
+        save_config(self.cfg)
+
+    def on_toggle_startup(self):
+        enabled = bool(self.run_startup_var.get())
+        try:
+            set_run_at_startup(enabled)
+            self.persist_config()
+            self.set_status("Status: Startup setting updated")
+        except Exception as e:
+            self.run_startup_var.set(not enabled)
+            messagebox.showerror("Startup error", f"Couldn't update startup setting:\n{e}")
+            self.set_status("Status: Failed to update startup")
+
+    def on_toggle_run_minimized(self):
+        self.persist_config()
+        self.set_status("Status: Saved")
+
+    def start_monitoring(self, minimize: bool):
+        nickname = self.nickname_var.get().strip()
+        if not nickname:
+            messagebox.showerror("Error", "Nickname cannot be empty.")
+            return
+
+        if self.monitoring:
+            if minimize:
+                self.minimize_to_tray()
+            return
+
+        self.persist_config()
+
+        self.monitoring = True
+        self.stop_event.clear()
+
+        self.btn_start.config(state="disabled")
+        self.btn_start_min.config(state="disabled")
+        self.btn_stop.config(state="normal")
+
+        self.set_status(f"Status: Monitoring (watching {PROCESS_NAME})")
+
+        self.worker_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.worker_thread.start()
+
+        if minimize:
+            self.minimize_to_tray()
+
+    def stop_monitoring(self):
+        if not self.monitoring:
+            return
+        self.stop_event.set()
+        self.monitoring = False
+
+        self.btn_start.config(state="normal")
+        self.btn_start_min.config(state="normal")
+        self.btn_stop.config(state="disabled")
+
+        self.set_status("Status: Stopped")
+
+    def monitor_loop(self):
+        was_running = False
+        was_in_deadwood = False
+        announced = False
+
+        deadwood_hits = 0
+        first_seen_running_ts = None
+
+        while not self.stop_event.is_set():
+            nickname = (self.nickname_var.get().strip() or "Ezekiel")
+
+            # Cheapest check first
+            running = is_process_running(PROCESS_NAME)
+
+            now = time.time()
+            if running and not was_running:
+                first_seen_running_ts = now
+            if not running:
+                first_seen_running_ts = None
+
+            sleep_for = CHECK_IDLE_SEC
+            in_deadwood_raw = False
+
+            # Only after grace: check if any window title contains "Deadwood County"
+            if running and first_seen_running_ts is not None:
+                if (now - first_seen_running_ts) >= GRACE_AFTER_PROCESS_START_SEC:
+                    try:
+                        in_deadwood_raw = any_window_title_contains("Deadwood County")
+                    except Exception:
+                        in_deadwood_raw = False
+
+            if running and in_deadwood_raw:
+                deadwood_hits += 1
+                sleep_for = CHECK_ACTIVE_SEC
+            else:
+                deadwood_hits = 0
+
+            in_deadwood_now = (deadwood_hits >= REQUIRED_HITS)
+
+            # Enter Deadwood (stable)
+            if in_deadwood_now and not was_in_deadwood:
+                try:
+                    yes = ask_user_to_announce(nickname)
+                    if yes:
+                        send_webhook_message(f"**{nickname}** is around.")
+                        announced = True
+                    else:
+                        announced = False
+                except Exception:
+                    announced = False
+
+            # Game closed
+            if (not running) and was_running:
+                if announced:
+                    try:
+                        send_webhook_message(f"**{nickname}** went to bed.")
+                    except Exception:
+                        pass
+                announced = False
+
+            was_running = running
+            was_in_deadwood = in_deadwood_now
+
+            # Sleep in small chunks so Stop is responsive
+            waited = 0.0
+            while waited < sleep_for and not self.stop_event.is_set():
+                time.sleep(0.2)
+                waited += 0.2
+
+    # ===== Tray behavior =====
+    def ensure_tray(self):
+        if self.tray_icon is not None:
+            return
+
+        image = create_tray_icon_image()
+
+        def on_show(icon, item):
+            self.root.after(0, self.show_window)
+
+        def on_stop(icon, item):
+            self.root.after(0, self.stop_monitoring)
+
+        def on_exit(icon, item):
+            self.root.after(0, self.exit_app)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show window", on_show),
+            pystray.MenuItem("Stop monitoring", on_stop),
+            pystray.MenuItem("Exit", on_exit),
+        )
+
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+
+        def run_tray():
+            self.tray_icon.run()
+
+        self.tray_thread = threading.Thread(target=run_tray, daemon=True)
+        self.tray_thread.start()
+
+    def minimize_to_tray(self):
+        self.ensure_tray()
+        self.is_hidden_to_tray = True
+        self.root.withdraw()
+        self.set_status(f"Status: Monitoring in tray (watching {PROCESS_NAME})")
+
+    def show_window(self):
+        self.is_hidden_to_tray = False
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(200, lambda: self.root.attributes("-topmost", False))
+
+    def exit_app(self):
+        try:
+            self.stop_event.set()
+            self.monitoring = False
+        finally:
+            if self.tray_icon is not None:
+                try:
+                    self.tray_icon.stop()
+                except Exception:
+                    pass
+            self.persist_config()
+            self.root.destroy()
+
+    def on_close(self):
+        # close button minimizes to tray
+        self.minimize_to_tray()
+
+
+def main():
+    root = tk.Tk()
+    app = DeadwoodApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
