@@ -29,7 +29,7 @@ PROCESS_NAME = "RedM_GTAProcess.exe"
 
 CHECK_IDLE_SEC = 5        # slower loop when idle / not in deadwood
 CHECK_ACTIVE_SEC = 2      # faster loop while confirming deadwood
-REQUIRED_HITS = 2         # must see deadwood this many consecutive checks
+REQUIRED_HITS = 2         # must see Deadwood this many consecutive checks
 GRACE_AFTER_PROCESS_START_SEC = 30  # wait after RedM starts before title checks
 
 # Webhook is handled on "backend" (not user-editable in UI)
