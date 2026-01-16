@@ -50,7 +50,7 @@ GetWindowTextLengthW = user32.GetWindowTextLengthW
 GetWindowTextW = user32.GetWindowTextW
 IsWindowVisible = user32.IsWindowVisible
 
-# Safer signatures (reduces weird crashes)
+# Safer signatures
 EnumWindows.restype = wintypes.BOOL
 EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 
@@ -129,15 +129,21 @@ def load_config() -> dict:
             "nickname": "Ezekiel",
             "run_at_startup": False,
             "run_minimized": False,
+            "start_monitoring_automatically": False,
+            "always_notify": False,
         }
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return {
-            "nickname": "Ezekiel",
-            "run_at_startup": False,
-            "run_minimized": False,
-        }
+        cfg = {}
+
+    # Backward-compatible defaults
+    cfg.setdefault("nickname", "Ezekiel")
+    cfg.setdefault("run_at_startup", False)
+    cfg.setdefault("run_minimized", False)
+    cfg.setdefault("start_monitoring_automatically", False)
+    cfg.setdefault("always_notify", False)
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
@@ -146,11 +152,6 @@ def save_config(cfg: dict) -> None:
 
 
 def get_startup_command() -> str:
-    """
-    Returns the command stored in HKCU Run. Works for both:
-    - packaged exe (sys.executable points to exe)
-    - running as script (use pythonw.exe for no console)
-    """
     exe = sys.executable
 
     # If running as a .py script, prefer pythonw.exe to avoid a console window
@@ -161,7 +162,7 @@ def get_startup_command() -> str:
 
     script = os.path.abspath(sys.argv[0])
 
-    # If packaged, sys.argv[0] is usually the exe itself; still safe
+    # If packaged, sys.argv[0] is usually the exe itself
     if exe.lower().endswith(".exe") and script.lower().endswith(".exe"):
         return f'"{exe}"'
     return f'"{exe}" "{script}"'
@@ -244,6 +245,9 @@ class DeadwoodApp:
         startup_state = is_startup_enabled() if self.cfg.get("run_at_startup") else False
         self.run_startup_var = tk.BooleanVar(value=startup_state)
 
+        self.auto_monitor_var = tk.BooleanVar(value=bool(self.cfg.get("start_monitoring_automatically", False)))
+        self.always_notify_var = tk.BooleanVar(value=bool(self.cfg.get("always_notify", False)))
+
         self.status_var = tk.StringVar(value=f"Status: Idle (watching {PROCESS_NAME})")
         self.build_ui()
 
@@ -257,9 +261,9 @@ class DeadwoodApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Auto-start minimized if configured
-        if self.run_minimized_var.get():
-            self.start_monitoring(minimize=True)
+        # Auto start monitoring if enabled
+        if self.auto_monitor_var.get():
+            self.start_monitoring(minimize=self.run_minimized_var.get())
 
     def build_ui(self):
         pad = 12
@@ -269,6 +273,7 @@ class DeadwoodApp:
         tk.Label(frame, text="Nickname").grid(row=0, column=0, sticky="w")
         tk.Entry(frame, textvariable=self.nickname_var, width=32).grid(row=0, column=1, sticky="w", padx=(8, 0))
 
+        # Checkboxes
         self.cb_startup = tk.Checkbutton(
             frame,
             text="Run at startup",
@@ -281,14 +286,30 @@ class DeadwoodApp:
             frame,
             text="Run minimized",
             variable=self.run_minimized_var,
-            command=self.on_toggle_run_minimized,
+            command=self.on_toggle_any_setting,
         )
         self.cb_minimized.grid(row=2, column=0, columnspan=2, sticky="w")
 
-        tk.Label(frame, textvariable=self.status_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.cb_auto_monitor = tk.Checkbutton(
+            frame,
+            text="Start monitoring automatically",
+            variable=self.auto_monitor_var,
+            command=self.on_toggle_any_setting,
+        )
+        self.cb_auto_monitor.grid(row=3, column=0, columnspan=2, sticky="w")
+
+        self.cb_always_notify = tk.Checkbutton(
+            frame,
+            text="Always notify",
+            variable=self.always_notify_var,
+            command=self.on_toggle_any_setting,
+        )
+        self.cb_always_notify.grid(row=4, column=0, columnspan=2, sticky="w")
+
+        tk.Label(frame, textvariable=self.status_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         btns = tk.Frame(frame)
-        btns.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        btns.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         self.btn_start = tk.Button(btns, text="Start monitoring", command=lambda: self.start_monitoring(minimize=False))
         self.btn_start.pack(side="left")
@@ -307,7 +328,7 @@ class DeadwoodApp:
             frame,
             text="Tip: When minimized, use the tray icon menu to show/stop/exit.",
             fg="gray",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def set_status(self, text: str):
         self.status_var.set(text)
@@ -316,7 +337,13 @@ class DeadwoodApp:
         self.cfg["nickname"] = self.nickname_var.get().strip() or "Ezekiel"
         self.cfg["run_at_startup"] = bool(self.run_startup_var.get())
         self.cfg["run_minimized"] = bool(self.run_minimized_var.get())
+        self.cfg["start_monitoring_automatically"] = bool(self.auto_monitor_var.get())
+        self.cfg["always_notify"] = bool(self.always_notify_var.get())
         save_config(self.cfg)
+
+    def on_toggle_any_setting(self):
+        self.persist_config()
+        self.set_status("Status: Saved")
 
     def on_toggle_startup(self):
         enabled = bool(self.run_startup_var.get())
@@ -328,10 +355,6 @@ class DeadwoodApp:
             self.run_startup_var.set(not enabled)
             messagebox.showerror("Startup error", f"Couldn't update startup setting:\n{e}")
             self.set_status("Status: Failed to update startup")
-
-    def on_toggle_run_minimized(self):
-        self.persist_config()
-        self.set_status("Status: Saved")
 
     def start_monitoring(self, minimize: bool):
         nickname = self.nickname_var.get().strip()
@@ -383,6 +406,7 @@ class DeadwoodApp:
 
         while not self.stop_event.is_set():
             nickname = (self.nickname_var.get().strip() or "Ezekiel")
+            always_notify = bool(self.always_notify_var.get())
 
             # Cheapest check first
             running = is_process_running(PROCESS_NAME)
@@ -415,7 +439,11 @@ class DeadwoodApp:
             # Enter Deadwood (stable)
             if in_deadwood_now and not was_in_deadwood:
                 try:
-                    yes = ask_user_to_announce(nickname)
+                    if always_notify:
+                        yes = True
+                    else:
+                        yes = ask_user_to_announce(nickname)
+
                     if yes:
                         send_webhook_message(f"**{nickname}** is around.")
                         announced = True
