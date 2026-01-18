@@ -43,7 +43,7 @@ RUN_KEY_NAME = "DeadwoodPresenceChecker"
 APPDATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = APPDATA_DIR / "config.json"
 LOG_PATH = APPDATA_DIR / "log.txt"
-APP_VERSION = "v0.5"
+APP_VERSION = "v0.6"
 
 
 # ===== WinAPI: enumerate visible windows and read titles =====
