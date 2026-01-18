@@ -10,6 +10,7 @@ import webbrowser
 import psutil
 import requests
 import traceback
+from typing import Optional
 from PIL import Image, ImageDraw, ImageTk
 
 
@@ -102,6 +103,20 @@ def any_window_title_contains(substring: str) -> bool:
     EnumWindows(enum_proc, 0)
     return found
 
+def get_startup_command_current() -> Optional[str]:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, RUN_KEY_NAME)
+            return val
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
 
 def is_process_running(proc_name: str) -> bool:
     target = proc_name.lower()
@@ -270,6 +285,16 @@ class DeadwoodApp:
         self.root.resizable(False, False)
 
         self.cfg = load_config()
+        # If user wants startup enabled, ensure the registry points to THIS version/exe path
+        if self.cfg.get("run_at_startup", False):
+            try:
+                desired = get_startup_command()
+                current = get_startup_command_current()
+                if current != desired:
+                    set_run_at_startup(True)
+                    log(f"Startup repaired. Old: {current!r} New: {desired!r}")
+            except Exception as e:
+                log(f"Startup repair failed: {e}")
 
         # Monitoring state
         self.monitoring = False
