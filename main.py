@@ -9,13 +9,12 @@ from tkinter import messagebox
 import webbrowser
 import psutil
 import requests
-import traceback
-from typing import Optional
 from PIL import Image, ImageDraw, ImageTk
 
 
 # Tray
 import pystray
+from PIL import Image, ImageDraw
 
 # Startup registry (Windows)
 import winreg
@@ -23,6 +22,130 @@ import winreg
 # WinAPI window title scan
 import ctypes
 from ctypes import wintypes
+
+
+# ===== Version metadata (for UI version + instance detection) =====
+# Works best in the packaged EXE built with PyInstaller --version-file.
+version_dll = ctypes.windll.version
+GetFileVersionInfoSizeW = version_dll.GetFileVersionInfoSizeW
+GetFileVersionInfoW = version_dll.GetFileVersionInfoW
+VerQueryValueW = version_dll.VerQueryValueW
+
+GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+GetFileVersionInfoSizeW.restype = wintypes.DWORD
+GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID]
+GetFileVersionInfoW.restype = wintypes.BOOL
+VerQueryValueW.argtypes = [wintypes.LPCVOID, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+VerQueryValueW.restype = wintypes.BOOL
+
+
+def get_version_string_value(exe_path: str, key: str) -> str:
+    """Return a version resource string (e.g., ProductVersion) from an EXE, or '' if missing."""
+    try:
+        handle = wintypes.DWORD(0)
+        size = GetFileVersionInfoSizeW(exe_path, ctypes.byref(handle))
+        if not size:
+            return ""
+        buf = (ctypes.c_byte * size)()
+        if not GetFileVersionInfoW(exe_path, 0, size, ctypes.byref(buf)):
+            return ""
+
+        # Try common translations (US English unicode and fallback)
+        for trans in ("040904B0", "040904E4", "000004B0"):
+            subblock = f"\\StringFileInfo\\{trans}\\{key}"
+            value_ptr = ctypes.c_void_p()
+            value_len = wintypes.UINT(0)
+            ok = VerQueryValueW(ctypes.byref(buf), subblock, ctypes.byref(value_ptr), ctypes.byref(value_len))
+            if ok and value_ptr.value:
+                return (ctypes.wstring_at(value_ptr.value) or "").strip()
+        return ""
+    except Exception:
+        return ""
+
+
+def get_app_display_version() -> str:
+    """UI version label. In EXE build, reads ProductVersion/FileVersion. In .py run, uses a dev fallback."""
+    try:
+        if getattr(sys, 'frozen', False):
+            exe = os.path.abspath(sys.executable)
+            v = get_version_string_value(exe, 'ProductVersion') or get_version_string_value(exe, 'FileVersion')
+            if v:
+                # Normalize to vX.Y.Z if possible
+                return v if v.lower().startswith('v') else f"v{v}"
+    except Exception:
+        pass
+    return "v0.0-dev"
+
+
+def exe_looks_like_our_app(exe_path: str) -> bool:
+    """Identify our app by version metadata (preferred) or known filenames."""
+    base = os.path.basename(exe_path).lower()
+    if base in ("deadwood presence checker.exe", "deadwood.presence.checker.exe"):
+        return True
+
+    # Version-info match (works for newer builds built with --version-file)
+    prod = get_version_string_value(exe_path, 'ProductName')
+    desc = get_version_string_value(exe_path, 'FileDescription')
+    internal = get_version_string_value(exe_path, 'InternalName')
+    if prod.strip() == APP_NAME:
+        return True
+    if desc.strip() == APP_NAME:
+        return True
+    if internal.strip().lower() == RUN_KEY_NAME.lower():
+        return True
+
+    return False
+
+
+def list_other_running_app_instances() -> list[tuple[psutil.Process, str]]:
+    """Return [(process, exe_path)] for other running instances of our app (EXE only)."""
+    out = []
+    my_pid = os.getpid()
+    for pr in psutil.process_iter(['pid']):
+        try:
+            if pr.info.get('pid') == my_pid:
+                continue
+            exe = pr.exe()
+            if exe and exe_looks_like_our_app(exe):
+                out.append((pr, exe))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            continue
+    return out
+
+
+def newest_exe_path_among(exe_paths: list[str]) -> str:
+    """Pick newest by file modification time."""
+    best = ""
+    best_m = -1.0
+    for path in exe_paths:
+        try:
+            m = os.path.getmtime(path)
+        except Exception:
+            m = 0.0
+        if m > best_m:
+            best_m = m
+            best = path
+    return best
+
+
+def terminate_processes(procs: list[psutil.Process]) -> None:
+    """Best-effort terminate/kill."""
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    try:
+        gone, alive = psutil.wait_procs(procs, timeout=2)
+        for p in alive:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 # ====== BACKEND CONFIG ======
@@ -34,7 +157,7 @@ REQUIRED_HITS = 2         # must see Deadwood this many consecutive checks
 GRACE_AFTER_PROCESS_START_SEC = 30  # wait after RedM starts before title checks
 
 # Webhook is handled on "backend" (not user-editable in UI)
-WEBHOOK_URL = "https://discord.com/api/webhooks/1462018244432105626/gdy8dwYebfdUKhIpnKuYhMWseh4XIoLLizxP-Cl54Chb1mQdOiTlxFvy7EGPuzW-5TND"
+WEBHOOK_URL = "WEBHOOK_URL"
 # ============================
 
 APP_NAME = "Deadwood Presence Checker"
@@ -42,8 +165,6 @@ RUN_KEY_NAME = "DeadwoodPresenceChecker"
 
 APPDATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = APPDATA_DIR / "config.json"
-LOG_PATH = APPDATA_DIR / "log.txt"
-APP_VERSION = "v0.6"
 
 
 # ===== WinAPI: enumerate visible windows and read titles =====
@@ -103,20 +224,6 @@ def any_window_title_contains(substring: str) -> bool:
     EnumWindows(enum_proc, 0)
     return found
 
-def get_startup_command_current() -> Optional[str]:
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_READ,
-        ) as key:
-            val, _ = winreg.QueryValueEx(key, RUN_KEY_NAME)
-            return val
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return None
 
 def is_process_running(proc_name: str) -> bool:
     target = proc_name.lower()
@@ -133,29 +240,12 @@ def is_process_running(proc_name: str) -> bool:
 
 
 def send_webhook_message(content: str) -> None:
-    log(f"Webhook: sending: {content}")
-    try:
-        r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
-        r.raise_for_status()
-        log(f"Webhook: sent OK (status={r.status_code})")
-    except Exception as e:
-        log(f"Webhook: FAILED: {e}\n{traceback.format_exc()}")
-        raise
+    r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+    r.raise_for_status()
 
 
 def ensure_config_dir():
     APPDATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def log(msg: str):
-    """Append a timestamped line to %APPDATA%\Deadwood Presence Checker\log.txt. Never raises."""
-    try:
-        ensure_config_dir()
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
 
 def resource_path(relative_path: str) -> str:
     """
@@ -177,7 +267,7 @@ def set_window_icon(root):
         root.iconphoto(True, icon)
         root._icon_ref = icon  # prevent garbage collection
     except Exception as e:
-        log(f"Failed to set window icon: {e}")
+        print("Failed to set window icon:", e)
 
 
 def load_config() -> dict:
@@ -285,16 +375,6 @@ class DeadwoodApp:
         self.root.resizable(False, False)
 
         self.cfg = load_config()
-        # If user wants startup enabled, ensure the registry points to THIS version/exe path
-        if self.cfg.get("run_at_startup", False):
-            try:
-                desired = get_startup_command()
-                current = get_startup_command_current()
-                if current != desired:
-                    set_run_at_startup(True)
-                    log(f"Startup repaired. Old: {current!r} New: {desired!r}")
-            except Exception as e:
-                log(f"Startup repair failed: {e}")
 
         # Monitoring state
         self.monitoring = False
@@ -317,6 +397,8 @@ class DeadwoodApp:
         self.always_notify_var = tk.BooleanVar(value=bool(self.cfg.get("always_notify", False)))
 
         self.status_var = tk.StringVar(value=f"Status: Idle (watching {PROCESS_NAME})")
+        self.app_version_var = tk.StringVar(value=get_app_display_version())
+        self.version_var = tk.StringVar(value=get_app_display_version())
         self.build_ui()
 
         # Apply startup if config wants it but registry differs
@@ -421,9 +503,9 @@ class DeadwoodApp:
 
         tk.Label(
             frame,
-            text=APP_VERSION,
+            textvariable=self.app_version_var,
             fg="gray",
-            font=("Segoe UI", 8),  # smaller than everything else
+            font=("Segoe UI", 8),
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
     def set_status(self, text: str):
@@ -468,8 +550,6 @@ class DeadwoodApp:
         self.monitoring = True
         self.stop_event.clear()
 
-        log("Monitoring started")
-
         self.btn_start.config(state="disabled")
         self.btn_start_min.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -485,12 +565,8 @@ class DeadwoodApp:
     def stop_monitoring(self):
         if not self.monitoring:
             return
-
-        log("Monitoring stopped")
         self.stop_event.set()
         self.monitoring = False
-
-        log("Monitoring stopped by user")
 
         self.btn_start.config(state="normal")
         self.btn_start_min.config(state="normal")
@@ -549,7 +625,7 @@ class DeadwoodApp:
                     presence_decided = True  # IMPORTANT: latch decision (Yes OR No)
 
                     if yes:
-                        send_webhook_message(f" :inbox_tray: **{nickname}** is around.")
+                        send_webhook_message(f"**{nickname}** is around.")
                         presence_announced = True
                 except Exception:
                     # If something fails, do NOT lock the user out forever.
@@ -560,7 +636,7 @@ class DeadwoodApp:
             if (not running) and was_running:
                 if presence_announced:
                     try:
-                        send_webhook_message(f" :bed: **{nickname}** went to bed.")
+                        send_webhook_message(f"**{nickname}** went to bed.")
                     except Exception:
                         pass
 
@@ -599,8 +675,14 @@ class DeadwoodApp:
             pystray.MenuItem("Exit", on_exit),
         )
 
-        # Create icon ONCE; Windows double-click triggers the default menu item above.
         self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+
+        def on_activate(icon, item=None):
+            # Double-click (or left-click on some systems) should show the window
+            self.root.after(0, self.show_window)
+
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        self.tray_icon.on_activate = on_activate
 
         def run_tray():
             self.tray_icon.run()
@@ -640,8 +722,46 @@ class DeadwoodApp:
 
 
 def main():
-    log("Application starting")
+    # If packaged EXE: detect other instances (including different filenames), keep newest, offer to close others
+    if getattr(sys, 'frozen', False):
+        try:
+            others = list_other_running_app_instances()
+            if others:
+                my_exe = os.path.abspath(sys.executable)
+                all_exes = [my_exe] + [exe for _, exe in others]
+                newest = newest_exe_path_among(all_exes)
+
+                # If we're not the newest, exit quietly (newer instance should win)
+                if os.path.abspath(newest).lower() != os.path.abspath(my_exe).lower():
+                    temp = tk.Tk()
+                    temp.withdraw()
+                    temp.attributes('-topmost', True)
+                    messagebox.showinfo(
+                        APP_NAME,
+                        'A newer version is already running. This one will now close.',
+                        parent=temp
+                    )
+                    temp.destroy()
+                    return
+
+                # We are the newest -> ask if user wants to terminate other running instances
+                temp = tk.Tk()
+                temp.withdraw()
+                temp.attributes('-topmost', True)
+                yes = messagebox.askyesno(
+                    APP_NAME,
+                    'Another instance was detected running in the background.\n\nDo you want to terminate the other instance(s) now?',
+                    parent=temp
+                )
+                temp.destroy()
+                if yes:
+                    terminate_processes([p for p, _ in others])
+        except Exception:
+            # Never block launch due to instance check
+            pass
+
     root = tk.Tk()
+
     set_window_icon(root)   # 👈 THIS sets the feather icon
     app = DeadwoodApp(root)
     root.mainloop()
