@@ -9,12 +9,12 @@ from tkinter import messagebox
 import webbrowser
 import psutil
 import requests
+import traceback
 from PIL import Image, ImageDraw, ImageTk
 
 
 # Tray
 import pystray
-from PIL import Image, ImageDraw
 
 # Startup registry (Windows)
 import winreg
@@ -33,7 +33,7 @@ REQUIRED_HITS = 2         # must see Deadwood this many consecutive checks
 GRACE_AFTER_PROCESS_START_SEC = 30  # wait after RedM starts before title checks
 
 # Webhook is handled on "backend" (not user-editable in UI)
-WEBHOOK_URL = "https://discord.com/api/webhooks/1461755396526968843/_t6-ZBsJeD50cdJP3sVIaP5EQCm40abaINzgYLxBxs6VwaC5kUgFs2_WZRGTRw_vT-qD"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1462018244432105626/gdy8dwYebfdUKhIpnKuYhMWseh4XIoLLizxP-Cl54Chb1mQdOiTlxFvy7EGPuzW-5TND"
 # ============================
 
 APP_NAME = "Deadwood Presence Checker"
@@ -41,6 +41,8 @@ RUN_KEY_NAME = "DeadwoodPresenceChecker"
 
 APPDATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = APPDATA_DIR / "config.json"
+LOG_PATH = APPDATA_DIR / "log.txt"
+APP_VERSION = "v0.5"
 
 
 # ===== WinAPI: enumerate visible windows and read titles =====
@@ -116,12 +118,29 @@ def is_process_running(proc_name: str) -> bool:
 
 
 def send_webhook_message(content: str) -> None:
-    r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
-    r.raise_for_status()
+    log(f"Webhook: sending: {content}")
+    try:
+        r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=10)
+        r.raise_for_status()
+        log(f"Webhook: sent OK (status={r.status_code})")
+    except Exception as e:
+        log(f"Webhook: FAILED: {e}\n{traceback.format_exc()}")
+        raise
 
 
 def ensure_config_dir():
     APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log(msg: str):
+    """Append a timestamped line to %APPDATA%\Deadwood Presence Checker\log.txt. Never raises."""
+    try:
+        ensure_config_dir()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 def resource_path(relative_path: str) -> str:
     """
@@ -143,7 +162,7 @@ def set_window_icon(root):
         root.iconphoto(True, icon)
         root._icon_ref = icon  # prevent garbage collection
     except Exception as e:
-        print("Failed to set window icon:", e)
+        log(f"Failed to set window icon: {e}")
 
 
 def load_config() -> dict:
@@ -294,7 +313,7 @@ class DeadwoodApp:
         frame = tk.Frame(self.root, padx=pad, pady=pad)
         frame.pack()
 
-        tk.Label(frame, text="Nickname").grid(row=0, column=0, sticky="w")
+        tk.Label(frame, text="In character name:").grid(row=0, column=0, sticky="w")
         tk.Entry(frame, textvariable=self.nickname_var, width=32).grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         # Checkboxes
@@ -375,6 +394,13 @@ class DeadwoodApp:
         link.bind("<Leave>", lambda e: link.config(font=("Segoe UI", 9)))
         link.grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
+        tk.Label(
+            frame,
+            text=APP_VERSION,
+            fg="gray",
+            font=("Segoe UI", 8),  # smaller than everything else
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
     def set_status(self, text: str):
         self.status_var.set(text)
 
@@ -417,11 +443,13 @@ class DeadwoodApp:
         self.monitoring = True
         self.stop_event.clear()
 
+        log("Monitoring started")
+
         self.btn_start.config(state="disabled")
         self.btn_start_min.config(state="disabled")
         self.btn_stop.config(state="normal")
 
-        self.set_status(f"Status: Monitoring (watching {PROCESS_NAME})")
+        self.set_status(f"Status: Monitoring for RedM")
 
         self.worker_thread = threading.Thread(target=self.monitor_loop, daemon=True)
         self.worker_thread.start()
@@ -432,8 +460,12 @@ class DeadwoodApp:
     def stop_monitoring(self):
         if not self.monitoring:
             return
+
+        log("Monitoring stopped")
         self.stop_event.set()
         self.monitoring = False
+
+        log("Monitoring stopped by user")
 
         self.btn_start.config(state="normal")
         self.btn_start_min.config(state="normal")
@@ -443,8 +475,8 @@ class DeadwoodApp:
 
     def monitor_loop(self):
         was_running = False
-        was_in_deadwood = False
-        announced = False
+        presence_announced = False
+        presence_decided = False  # user has made a yes/no decision this session
 
         deadwood_hits = 0
         first_seen_running_ts = None
@@ -482,29 +514,34 @@ class DeadwoodApp:
             in_deadwood_now = (deadwood_hits >= REQUIRED_HITS)
 
             # Enter Deadwood (stable)
-            if in_deadwood_now and not was_in_deadwood:
+            if in_deadwood_now and not presence_decided:
                 try:
                     if always_notify:
                         yes = True
                     else:
                         yes = ask_user_to_announce(nickname)
 
+                    presence_decided = True  # IMPORTANT: latch decision (Yes OR No)
+
                     if yes:
-                        send_webhook_message(f"**{nickname}** is around.")
-                        announced = True
-                    else:
-                        announced = False
+                        send_webhook_message(f" :inbox_tray: **{nickname}** is around.")
+                        presence_announced = True
                 except Exception:
-                    announced = False
+                    # If something fails, do NOT lock the user out forever.
+                    # Only mark decided if we successfully got a decision.
+                    pass
 
             # Game closed
             if (not running) and was_running:
-                if announced:
+                if presence_announced:
                     try:
-                        send_webhook_message(f"**{nickname}** went to bed.")
+                        send_webhook_message(f" :bed: **{nickname}** went to bed.")
                     except Exception:
                         pass
-                announced = False
+
+                # Reset session state ONLY when game closes
+                presence_decided = False
+                presence_announced = False
 
             was_running = running
             was_in_deadwood = in_deadwood_now
@@ -537,14 +574,8 @@ class DeadwoodApp:
             pystray.MenuItem("Exit", on_exit),
         )
 
+        # Create icon ONCE; Windows double-click triggers the default menu item above.
         self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
-
-        def on_activate(icon, item=None):
-            # Double-click (or left-click on some systems) should show the window
-            self.root.after(0, self.show_window)
-
-        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
-        self.tray_icon.on_activate = on_activate
 
         def run_tray():
             self.tray_icon.run()
@@ -556,7 +587,7 @@ class DeadwoodApp:
         self.ensure_tray()
         self.is_hidden_to_tray = True
         self.root.withdraw()
-        self.set_status(f"Status: Monitoring in tray (watching {PROCESS_NAME})")
+        self.set_status(f"Status: Monitoring in tray for RedM")
 
     def show_window(self):
         self.is_hidden_to_tray = False
@@ -584,6 +615,7 @@ class DeadwoodApp:
 
 
 def main():
+    log("Application starting")
     root = tk.Tk()
     set_window_icon(root)   # 👈 THIS sets the feather icon
     app = DeadwoodApp(root)
