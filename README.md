@@ -8,9 +8,9 @@ Python tool to detect whether RedM is running and whether you are in "Deadwood C
 
 \## Usage
 
-\- Run the script (Python 3.x)
+\- Run the script
 
-\- Configure settings if provided
+\- Configure settings to your liking
 
 
 
